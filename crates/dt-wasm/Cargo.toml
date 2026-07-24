@@ -2,7 +2,7 @@
 name = "dt-wasm"
 # wasm-pack generates pkg-node/pkg-web package.json from these fields,
 # so this version is the npm version
-version = "2.2.0"
+version = "2.2.1"
 authors = ["Seph Gentle <me@josephg.com>", "Michael Toomim <toomim@gmail.com>", "Greg Little"]
 edition = "2021"
 license = "ISC OR Apache-2.0"
