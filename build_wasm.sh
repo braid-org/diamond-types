@@ -21,17 +21,16 @@ wasm-pack build --target nodejs --out-dir ../../pkg-node --out-name dt crates/dt
 
 # Web code needs to have "main" defined since its an es6 module package
 sed -i.old 's/"module":/"main":/' pkg-web/package.json
-sed -i.old 's/"name": "dt-wasm"/"name": "diamond-types-web"/' pkg-web/package.json
-sed -i.old 's/"name": "dt-wasm"/"name": "diamond-types-node"/' pkg-node/package.json
+sed -i.old 's|"name": "dt-wasm"|"name": "@braid.org/diamond-types-web"|' pkg-web/package.json
+sed -i.old 's|"name": "dt-wasm"|"name": "@braid.org/diamond-types-node"|' pkg-node/package.json
 sed -i.old 's/"files": \[/"files": \[\n    "dt_bg.wasm.br",/' pkg-web/package.json
 #perl -wlpi -e 'print "  \"type\": \"module\"," if $. == 2' pkg-web/package.json
 
-sed -i.old 's/"0.1.0"/"1.0.2"/' pkg-web/package.json
-sed -i.old 's/"0.1.0"/"1.0.2"/' pkg-node/package.json
+# The npm version comes from crates/dt-wasm/Cargo.toml
 
 rm pkg-*/package.json.old
 
-brotli -f pkg-web/*.wasm
+brotli -f pkg-web/*.wasm || echo "warning: no brotli; skipping .wasm.br"
 
 echo "=== After ==="
 ls -l pkg-web pkg-node

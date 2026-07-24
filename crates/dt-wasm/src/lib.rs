@@ -112,6 +112,39 @@ pub fn merge_versions(oplog: &DTOpLog, a: &[LV], b: &[LV]) -> Box<[LV]> {
     result.as_ref().into()
 }
 
+/// The inverse of localToRemoteVersion: map "agent-seq" version strings to
+/// local version indexes. With tolerant set, ids this oplog doesn't know
+/// are skipped instead of raising an error.
+pub fn remote_to_local_version(oplog: &DTOpLog, ids: JsValue, tolerant: bool) -> WasmResult {
+    use diamond_types::causalgraph::agent_assignment::remote_ids::RemoteVersion;
+
+    let ids: Vec<String> = serde_wasm_bindgen::from_value(ids)?;
+    let aa = &oplog.cg.agent_assignment;
+
+    let mut result: Vec<LV> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        // The seq comes after the last dash; agent names may contain dashes
+        let parsed = id.rsplit_once('-')
+            .and_then(|(name, seq)| Some((name, seq.parse::<usize>().ok()?)));
+        let lv = parsed.and_then(|(name, seq)|
+            aa.try_remote_to_local_version(RemoteVersion(name, seq)).ok());
+
+        match lv {
+            Some(lv) => result.push(lv),
+            None if tolerant => {},
+            None => {
+                let s = format!("version not found: {:?}", id);
+                let js: JsValue = s.into();
+                return Err(js.into());
+            }
+        }
+    }
+
+    // Frontiers are sorted sets
+    result.sort_unstable();
+    serde_wasm_bindgen::to_value(&result)
+}
+
 fn unwrap_agentid(agent_id: Option<AgentId>) -> AgentId {
     agent_id.expect_throw("Agent missing. Set agent before modifying oplog.")
 }
@@ -274,6 +307,11 @@ impl OpLog {
         local_to_remote_version(&self.inner, version)
     }
 
+    #[wasm_bindgen(js_name = remoteToLocalVersion)]
+    pub fn remote_to_local_version_js(&self, ids: JsValue, tolerant: Option<bool>) -> WasmResult {
+        remote_to_local_version(&self.inner, ids, tolerant.unwrap_or(false))
+    }
+
     #[wasm_bindgen(js_name = getRemoteVersion)]
     pub fn get_remote_version(&self) -> WasmResult {
         oplog_version_to_remote_version(&self.inner)
@@ -381,6 +419,23 @@ impl Doc {
     #[wasm_bindgen]
     pub fn get(&self) -> String {
         self.inner.branch.content().to_string()
+    }
+
+    /// The document's text as of some historical (local) version
+    #[wasm_bindgen(js_name = getStringAt)]
+    pub fn get_string_at(&self, version: &[LV]) -> String {
+        self.inner.oplog.checkout(version).content().to_string()
+    }
+
+    /// The document's length in characters as of some historical version
+    #[wasm_bindgen(js_name = lenAt)]
+    pub fn len_at(&self, version: &[LV]) -> usize {
+        self.inner.oplog.checkout(version).len()
+    }
+
+    #[wasm_bindgen(js_name = remoteToLocalVersion)]
+    pub fn remote_to_local_version_js(&self, ids: JsValue, tolerant: Option<bool>) -> WasmResult {
+        remote_to_local_version(&self.inner.oplog, ids, tolerant.unwrap_or(false))
     }
 
     #[wasm_bindgen]
