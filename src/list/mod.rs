@@ -19,6 +19,8 @@ pub(crate) mod op_iter;
 
 // pub mod old_merge;
 pub mod oplog;
+pub mod version_patches;
+pub mod xf_patches;
 mod branch;
 pub mod encoding;
 pub mod op_metrics;

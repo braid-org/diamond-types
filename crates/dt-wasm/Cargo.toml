@@ -2,7 +2,7 @@
 name = "dt-wasm"
 # wasm-pack generates pkg-node/pkg-web package.json from these fields,
 # so this version is the npm version
-version = "2.2.1"
+version = "2.4.2"
 authors = ["Seph Gentle <me@josephg.com>", "Michael Toomim <toomim@gmail.com>", "Greg Little"]
 edition = "2021"
 license = "ISC OR Apache-2.0"
@@ -19,7 +19,7 @@ default = ["console_error_panic_hook"]
 wasm-bindgen = "0.2.79"
 serde-wasm-bindgen = "0.4.2"
 smallvec = { version = "1.8.0", features = ["union"] }
-serde = "1.0.136"
+serde = { version = "1.0.136", features = ["derive"] }
 
 # Needed for jumprope.
 getrandom = { version = "0.2.4", features = ["js"] }

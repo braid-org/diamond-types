@@ -1267,9 +1267,10 @@ mod test {
         let out_file = format!("idxtrace_{bench_name}.json");
         let mut iter = o.get_xf_operations_full(&[], o.cg.version.as_ref());
         while let Some(_) = iter.next() {}
-        let json = iter.tracker.index.actions_to_json();
-        std::fs::write(&out_file, &json).unwrap();
-        println!("wrote index writes to {out_file}");
+        // The recording_index_tree this used is disabled (see ost/mod.rs)
+        // let json = iter.tracker.index.actions_to_json();
+        // std::fs::write(&out_file, &json).unwrap();
+        println!("(index trace disabled; would have written {out_file})");
     }
 
 

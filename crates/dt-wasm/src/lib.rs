@@ -112,17 +112,22 @@ pub fn merge_versions(oplog: &DTOpLog, a: &[LV], b: &[LV]) -> Box<[LV]> {
     result.as_ref().into()
 }
 
-/// The inverse of localToRemoteVersion: map "agent-seq" version strings to
-/// local version indexes. With tolerant set, ids this oplog doesn't know
-/// are skipped instead of raising an error.
-pub fn remote_to_local_version(oplog: &DTOpLog, ids: JsValue, tolerant: bool) -> WasmResult {
+/// Every (agent, seq_start, len) run this oplog knows, in local-version
+/// order. For building version indexes without parsing the file format.
+pub fn agent_seq_runs(oplog: &DTOpLog) -> WasmResult {
+    let runs: Vec<(&str, usize, usize)> = oplog.iter_remote_mappings()
+        .map(|s| (s.0, s.1.start, s.1.end - s.1.start))
+        .collect();
+    serde_wasm_bindgen::to_value(&runs)
+}
+
+/// Map "agent-seq" version strings to local version indexes
+fn parse_remote_ids(oplog: &DTOpLog, ids: &[String], tolerant: bool) -> Result<Vec<LV>, String> {
     use diamond_types::causalgraph::agent_assignment::remote_ids::RemoteVersion;
 
-    let ids: Vec<String> = serde_wasm_bindgen::from_value(ids)?;
     let aa = &oplog.cg.agent_assignment;
-
     let mut result: Vec<LV> = Vec::with_capacity(ids.len());
-    for id in &ids {
+    for id in ids {
         // The seq comes after the last dash; agent names may contain dashes
         let parsed = id.rsplit_once('-')
             .and_then(|(name, seq)| Some((name, seq.parse::<usize>().ok()?)));
@@ -132,17 +137,155 @@ pub fn remote_to_local_version(oplog: &DTOpLog, ids: JsValue, tolerant: bool) ->
         match lv {
             Some(lv) => result.push(lv),
             None if tolerant => {},
-            None => {
-                let s = format!("version not found: {:?}", id);
-                let js: JsValue = s.into();
-                return Err(js.into());
-            }
+            None => return Err(format!("version not found: {:?}", id)),
         }
     }
 
     // Frontiers are sorted sets
     result.sort_unstable();
-    serde_wasm_bindgen::to_value(&result)
+    Ok(result)
+}
+
+/// The inverse of localToRemoteVersion. With tolerant set, ids this oplog
+/// doesn't know are skipped instead of raising an error.
+pub fn remote_to_local_version(oplog: &DTOpLog, ids: JsValue, tolerant: bool) -> WasmResult {
+    let ids: Vec<String> = serde_wasm_bindgen::from_value(ids)?;
+    match parse_remote_ids(oplog, &ids, tolerant) {
+        Ok(result) => serde_wasm_bindgen::to_value(&result),
+        Err(s) => {
+            let js: JsValue = s.into();
+            Err(js.into())
+        }
+    }
+}
+
+/// Expand the history since `since` (remote version id strings, or
+/// null/undefined for everything) into braid-text's per-version patch
+/// shape: one patch per run of same-agent causally chained ops
+pub fn get_version_patches(oplog: &DTOpLog, since: JsValue) -> WasmResult {
+    #[derive(serde::Serialize)]
+    struct JsPatch {
+        version: String,
+        parents: Vec<String>,
+        unit: &'static str,
+        range: String,
+        content: String,
+        start: usize,
+        end: usize,
+    }
+
+    let frontier: Vec<LV> = if since.is_null() || since.is_undefined() {
+        Vec::new()
+    } else {
+        let ids: Vec<String> = serde_wasm_bindgen::from_value(since)?;
+        match parse_remote_ids(oplog, &ids, false) {
+            Ok(p) => p,
+            Err(s) => {
+                let js: JsValue = s.into();
+                return Err(js.into());
+            }
+        }
+    };
+
+    let aa = &oplog.cg.agent_assignment;
+    let patches: Vec<JsPatch> = oplog.version_patches_since(&frontier)
+        .into_iter().map(|p| {
+            let mut parents: Vec<String> = p.parents.as_ref().iter().map(|lv| {
+                let rv = aa.local_to_remote_version(*lv);
+                format!("{}-{}", rv.0, rv.1)
+            }).collect();
+            // Braid sorts parents as version strings
+            parents.sort();
+
+            let (s, e) = (p.pos_start, p.pos_end);
+            JsPatch {
+                version: format!("{}-{}", p.agent, p.seq_end),
+                parents,
+                unit: "text",
+                // Inserts address a point; deletes address their span
+                range: if p.content.is_some() { format!("[{s}:{s}]") }
+                       else { format!("[{s}:{e}]") },
+                content: p.content.map(|c| c.to_string()).unwrap_or_default(),
+                start: s,
+                end: e,
+            }
+        }).collect();
+
+    serde_wasm_bindgen::to_value(&patches)
+}
+
+#[derive(serde::Serialize)]
+struct JsXFPatch {
+    unit: &'static str,
+    range: String,
+    content: String,
+}
+
+fn xf_patch_shape(patches: Vec<diamond_types::list::xf_patches::Replacement>)
+    -> Vec<JsXFPatch> {
+    patches.into_iter().map(|p| JsXFPatch {
+        unit: "text",
+        range: format!("[{}:{}]", p.range.start, p.range.end),
+        content: p.content.to_string(),
+    }).collect()
+}
+
+/// The transformed changes since `since`, as absolute-coordinate range
+/// replacements: braid-text's get_xf_patches
+pub fn get_xf_patches(oplog: &DTOpLog, since: &[LV]) -> WasmResult {
+    serde_wasm_bindgen::to_value(&xf_patch_shape(oplog.xf_absolute_since(since)))
+}
+
+/// The pure conversion, for callers holding relative patches already:
+/// braid-text's relative_to_absolute_patches
+pub fn relative_to_absolute_patches_js(patches: JsValue) -> WasmResult {
+    use diamond_types::list::xf_patches::{Replacement, relative_to_absolute_patches};
+
+    #[derive(serde::Deserialize)]
+    struct In { range: String, content: String }
+
+    let input: Vec<In> = serde_wasm_bindgen::from_value(patches)?;
+    let mut rel = Vec::with_capacity(input.len());
+    for p in &input {
+        let mut nums = p.range.split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<usize>().unwrap());
+        let (Some(start), Some(end)) = (nums.next(), nums.next()) else {
+            let js: JsValue = format!("bad range: {:?}", p.range).into();
+            return Err(js.into());
+        };
+        rel.push(Replacement { range: (start..end).into(),
+                               content: p.content.as_str().into() });
+    }
+    serde_wasm_bindgen::to_value(&xf_patch_shape(relative_to_absolute_patches(&rel)))
+}
+
+/// Apply one remote op run (an insert or a delete) straight into the
+/// oplog, instead of building a synthetic dt file for it and merging that
+pub fn apply_remote_op(oplog: &mut DTOpLog, agent: &str, start_seq: usize,
+                       parents: JsValue, pos: usize, del: usize, ins: Option<String>)
+                       -> WasmResult<Box<[usize]>> {
+    let ids: Vec<String> = serde_wasm_bindgen::from_value(parents)?;
+    let parents = match parse_remote_ids(oplog, &ids, false) {
+        Ok(p) => p,
+        Err(s) => {
+            let js: JsValue = s.into();
+            return Err(js.into());
+        }
+    };
+    let agent = oplog.get_or_create_agent_id(agent);
+
+    let op = if del > 0 {
+        let mut op = TextOperation::new_delete(pos .. pos + del);
+        // dt_create_bytes encodes deletes as backward runs; match it
+        op.loc.fwd = false;
+        op
+    } else {
+        TextOperation::new_insert(pos, ins.as_deref().unwrap_or(""))
+    };
+
+    let range = oplog.add_operations_remote(agent, &parents, start_seq, &[op]);
+    Ok(Box::new([range.start, range.end]))
 }
 
 fn unwrap_agentid(agent_id: Option<AgentId>) -> AgentId {
@@ -312,6 +455,16 @@ impl OpLog {
         remote_to_local_version(&self.inner, ids, tolerant.unwrap_or(false))
     }
 
+    #[wasm_bindgen(js_name = getAgentSeqRuns)]
+    pub fn get_agent_seq_runs(&self) -> WasmResult {
+        agent_seq_runs(&self.inner)
+    }
+
+    #[wasm_bindgen(js_name = getPatches)]
+    pub fn get_patches_js(&self, since: JsValue) -> WasmResult {
+        get_version_patches(&self.inner, since)
+    }
+
     #[wasm_bindgen(js_name = getRemoteVersion)]
     pub fn get_remote_version(&self) -> WasmResult {
         oplog_version_to_remote_version(&self.inner)
@@ -436,6 +589,42 @@ impl Doc {
     #[wasm_bindgen(js_name = remoteToLocalVersion)]
     pub fn remote_to_local_version_js(&self, ids: JsValue, tolerant: Option<bool>) -> WasmResult {
         remote_to_local_version(&self.inner.oplog, ids, tolerant.unwrap_or(false))
+    }
+
+    #[wasm_bindgen(js_name = getAgentSeqRuns)]
+    pub fn get_agent_seq_runs(&self) -> WasmResult {
+        agent_seq_runs(&self.inner.oplog)
+    }
+
+    #[wasm_bindgen(js_name = applyRemoteOp)]
+    pub fn apply_remote_op_js(&mut self, agent: &str, start_seq: usize, parents: JsValue,
+                              pos: usize, del: usize, ins: Option<String>) -> WasmResult<Box<[usize]>> {
+        let result = apply_remote_op(&mut self.inner.oplog, agent, start_seq, parents, pos, del, ins)?;
+        // Keep the branch at the tip, the way mergeBytes does
+        self.inner.branch.merge(&self.inner.oplog, self.inner.oplog.cg.version.as_ref());
+        Ok(result)
+    }
+
+    #[wasm_bindgen(js_name = getPatches)]
+    pub fn get_patches_js(&self, since: JsValue) -> WasmResult {
+        get_version_patches(&self.inner.oplog, since)
+    }
+
+    #[wasm_bindgen(js_name = getXFPatches)]
+    pub fn get_xf_patches_js(&self, since: &[LV]) -> WasmResult {
+        get_xf_patches(&self.inner.oplog, since)
+    }
+
+    /// toBytes() as of a historical version: the trimmed oplog,
+    /// complementing getPatchSince
+    #[wasm_bindgen(js_name = toBytesAt)]
+    pub fn to_bytes_at(&self, version: &[LV]) -> Vec<u8> {
+        self.inner.oplog.encode_at(version, &ENCODE_FULL)
+    }
+
+    #[wasm_bindgen(js_name = relativeToAbsolutePatches)]
+    pub fn relative_to_absolute_patches_js(patches: JsValue) -> WasmResult {
+        relative_to_absolute_patches_js(patches)
     }
 
     #[wasm_bindgen]
