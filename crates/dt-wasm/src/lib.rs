@@ -629,6 +629,19 @@ impl Doc {
         self.inner.oplog.len_at(version)
     }
 
+    /// How much longer the document is now than it was at `version`.
+    ///
+    /// A caller holding the current length can subtract this to learn the
+    /// length at an earlier version without replaying the history, which is
+    /// what positioning an edit from a peer needs. Only the operations
+    /// between the two versions are walked, so an edit written against a
+    /// version a few behind the current one costs almost nothing.
+    #[wasm_bindgen(js_name = lenSince)]
+    pub fn len_since(&self, version: &[LV]) -> f64 {
+        self.inner.oplog.len_delta(version, self.inner.oplog.cg.version.as_ref()) as f64
+    }
+
+
     #[wasm_bindgen(js_name = remoteToLocalVersion)]
     pub fn remote_to_local_version_js(&self, ids: JsValue, tolerant: Option<bool>) -> WasmResult {
         remote_to_local_version(&self.inner.oplog, ids, tolerant.unwrap_or(false))

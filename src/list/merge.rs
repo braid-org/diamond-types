@@ -78,31 +78,42 @@ impl ListOpLog {
     }
 
     /// The document's length in characters as of some version.
+    pub fn len_at(&self, version: FrontierRef) -> usize {
+        self.len_delta(&[], version) as usize
+    }
+
+    /// How much longer the document is at `to` than it was at `from`, where
+    /// `from` is an ancestor of `to`.
     ///
     /// This walks the same transformed operations that a checkout would
     /// apply, but only tallies their lengths, so it never builds the text
     /// itself. Concurrent deletes of the same character are counted once,
     /// since the transform reports the redundant half as already deleted.
-    pub fn len_at(&self, version: FrontierRef) -> usize {
-        let mut len = 0usize;
+    ///
+    /// The walk covers the operations between the two versions rather than
+    /// the whole history, so asking about a recent version is cheap however
+    /// long the document has been edited. A caller that knows the length at
+    /// the current version can therefore learn the length at a version a few
+    /// edits behind it without replaying anything else.
+    pub fn len_delta(&self, from: FrontierRef, to: FrontierRef) -> isize {
+        let mut delta = 0isize;
 
-        for xf in self.get_xf_operations_full(&[], version) {
+        let mut tally = |kind: ListOpKind, len: usize| {
+            match kind {
+                ListOpKind::Ins => delta += len as isize,
+                ListOpKind::Del => delta -= len as isize,
+            }
+        };
+
+        for xf in self.get_xf_operations_full(from, to) {
             match xf {
-                TransformedResultRaw::Apply { op: KVPair(_, op), .. } => {
-                    match op.kind {
-                        ListOpKind::Ins => len += op.len(),
-                        ListOpKind::Del => len -= op.len(),
-                    }
-                }
+                TransformedResultRaw::Apply { op: KVPair(_, op), .. } => tally(op.kind, op.len()),
 
                 // A fast-forwarded span needs no transforming, so its ops
                 // are read straight out of the oplog.
                 TransformedResultRaw::FF(range) => {
                     for KVPair(_, op) in self.operations.iter_range_ctx(range, &self.operation_ctx) {
-                        match op.kind {
-                            ListOpKind::Ins => len += op.len(),
-                            ListOpKind::Del => len -= op.len(),
-                        }
+                        tally(op.kind, op.len());
                     }
                 }
 
@@ -110,7 +121,7 @@ impl ListOpLog {
             }
         }
 
-        len
+        delta
     }
 
     #[cfg(feature = "merge_conflict_checks")]
@@ -265,5 +276,38 @@ mod test {
             assert_eq!(oplog.len_at(&version), oplog.checkout(&version).len(),
                        "length disagrees at {version:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod len_delta_tests {
+    use crate::list::ListOpLog;
+
+    /// Walking from an ancestor must give the same answer as walking from the
+    /// beginning, including where two branches delete the same characters.
+    #[test]
+    fn delta_matches_walking_from_the_start() {
+        let mut oplog = ListOpLog::new();
+        oplog.get_or_create_agent_id("a");
+        oplog.get_or_create_agent_id("b");
+
+        oplog.add_insert(0, 0, "hello world");
+        let base = oplog.cg.version.clone();
+
+        // Two branches from the same point, deleting overlapping spans
+        oplog.add_delete_at(0, base.as_ref(), 0..5);
+        let a_side = oplog.cg.version.clone();
+        oplog.add_delete_at(1, base.as_ref(), 3..8);
+        oplog.add_insert_at(1, oplog.cg.version.clone().as_ref(), 0, "xyz");
+
+        let tip = oplog.cg.version.clone();
+        assert_eq!(oplog.len_at(tip.as_ref()),
+                   (oplog.len_at(base.as_ref()) as isize
+                    + oplog.len_delta(base.as_ref(), tip.as_ref())) as usize);
+        assert_eq!(oplog.len_at(tip.as_ref()),
+                   (oplog.len_at(a_side.as_ref()) as isize
+                    + oplog.len_delta(a_side.as_ref(), tip.as_ref())) as usize);
+        assert_eq!(oplog.len_delta(tip.as_ref(), tip.as_ref()), 0);
+        assert_eq!(oplog.len_at(tip.as_ref()), oplog.checkout_tip().content.len_chars());
     }
 }
