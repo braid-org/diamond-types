@@ -42,7 +42,7 @@
 
 use smartstring::alias::String as SmartString;
 use rle::{HasLength, MergableSpan};
-use crate::{Frontier, LV};
+use crate::{DTRange, Frontier, LV};
 use crate::list::ListOpLog;
 use crate::list::operation::{ListOpKind, TextOperation};
 
@@ -140,12 +140,30 @@ impl ListOpLog {
     /// History outside its ancestor cone, in causal order, with runs
     /// summarized wherever that is lossless.
     pub fn updates_since(&self, version: &[LV]) -> Vec<Update> {
-        let ranges = self.cg.diff_since(version);
+        self.updates_over_spans(self.cg.diff_since(version))
+    }
+
+    /// The updates covering a span of local versions.
+    ///
+    /// Local versions are numbered in a topological order, so a span of them
+    /// is a contiguous slice of history, which is what a viewer showing a
+    /// window onto a long document wants. Runs are summarized within the
+    /// span, never across its edges, so asking for adjacent spans gives the
+    /// same updates as asking for their union would, only split at the seam.
+    pub fn updates_in_span(&self, span: DTRange) -> Vec<Update> {
+        let end = span.end.min(self.cg.len());
+        if span.start >= end { return Vec::new(); }
+        self.updates_over_spans(smallvec::smallvec![(span.start .. end).into()])
+    }
+
+    /// A span is a stretch of time -- a run of local versions -- as opposed to
+    /// a range, which is a stretch of the document's text.
+    fn updates_over_spans(&self, spans: smallvec::SmallVec<DTRange, 4>) -> Vec<Update> {
         let mut out = Vec::new();
 
-        for range in ranges {
+        for span in spans {
             let mut pending: Option<Run> = None;
-            for (op, entry, rvs) in self.iter_full_range(range) {
+            for (op, entry, rvs) in self.iter_full_range(span) {
                 let agent = rvs.0;
                 let seq_start = rvs.1.start;
 
@@ -678,5 +696,53 @@ mod encode_at_tests {
                        oplog.checkout(version).content().to_string(),
                        "reloaded document differs at {version:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use crate::list::ListOpLog;
+
+    /// Adjacent spans must together give the same updates as one big span,
+    /// give or take runs being split at the seam. This is what lets a viewer
+    /// page through history a window at a time.
+    #[test]
+    fn adjacent_spans_cover_the_whole() {
+        let mut oplog = ListOpLog::new();
+        let a = oplog.get_or_create_agent_id("a");
+        let b = oplog.get_or_create_agent_id("b");
+        let mut parents = vec![];
+        for i in 0..12 {
+            let agent = if i % 5 == 3 { b } else { a };
+            parents = vec![oplog.add_insert_at(agent, &parents, 0, "xy")];
+        }
+        let total = oplog.cg.len();
+
+        let whole = oplog.updates_in_span((0..total).into());
+        let chars_of = |ups: &[crate::list::observed_history::Update]| -> String {
+            ups.iter().filter_map(|u| u.content.clone().map(|c| c.to_string())).collect()
+        };
+
+        for cut in 1..total {
+            let mut split = oplog.updates_in_span((0..cut).into());
+            split.extend(oplog.updates_in_span((cut..total).into()));
+            assert_eq!(chars_of(&split), chars_of(&whole), "content differs at cut {cut}");
+        }
+
+        // and the whole span agrees with asking for everything since ROOT
+        assert_eq!(chars_of(&whole), chars_of(&oplog.updates_since(&[])));
+    }
+
+    #[test]
+    fn out_of_bounds_spans_are_empty_not_a_panic() {
+        let mut oplog = ListOpLog::new();
+        let a = oplog.get_or_create_agent_id("a");
+        oplog.add_insert_at(a, &[], 0, "hello");
+        let n = oplog.cg.len();
+        assert!(oplog.updates_in_span((n..n + 100).into()).is_empty());
+        assert!(oplog.updates_in_span((5..5).into()).is_empty());
+        // a span running past the end is clamped
+        assert_eq!(oplog.updates_in_span((0..n + 50).into()).len(),
+                   oplog.updates_in_span((0..n).into()).len());
     }
 }

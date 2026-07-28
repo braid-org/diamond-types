@@ -159,20 +159,79 @@ pub fn remote_to_local_version(oplog: &DTOpLog, ids: JsValue, tolerant: bool) ->
     }
 }
 
-/// The updates since `since` (remote version id strings, or null/undefined
-/// for all of Observed History), serialized into the JS patch shape
-pub fn get_updates(oplog: &DTOpLog, since: JsValue) -> WasmResult {
-    #[derive(serde::Serialize)]
-    struct JsPatch {
-        version: String,
-        parents: Vec<String>,
-        unit: &'static str,
-        range: String,
-        content: String,
-        start: usize,
-        end: usize,
-    }
+/// A braid range patch: replace `range` of `unit` with `content`. Ranges are
+/// measured in the document's text; see `span` for the other axis.
+#[derive(serde::Serialize)]
+struct RangePatch {
+    unit: &'static str,
+    range: String,
+    content: String,
+}
 
+/// A braid update.
+#[derive(serde::Serialize)]
+struct BraidUpdate {
+    /// A version is a set of event ids. The version an update arrives at is
+    /// always the single event it ends on, so this always holds one.
+    version: Vec<String>,
+    /// The event `parents` belongs to. An update summarizes a run of
+    /// consecutive events by one agent, so it covers `first_event` through
+    /// the event `version` names, and nothing else states how far back the
+    /// run reaches.
+    first_event: String,
+    /// The version this update applies to, which may be several events.
+    parents: Vec<String>,
+    patches: Vec<RangePatch>,
+}
+
+fn to_range_patch(r: diamond_types::list::relative_to_absolute::Replacement) -> RangePatch {
+    RangePatch {
+        unit: "text",
+        range: format!("[{}:{}]", r.range.start, r.range.end),
+        content: r.content.to_string(),
+    }
+}
+
+fn to_update(u: diamond_types::list::observed_history::Update,
+             oplog: &DTOpLog) -> BraidUpdate {
+    let aa = &oplog.cg.agent_assignment;
+    let mut parents: Vec<String> = u.parents.as_ref().iter().map(|lv| {
+        let rv = aa.local_to_remote_version(*lv);
+        format!("{}-{}", rv.0, rv.1)
+    }).collect();
+    // braid-text compares parent sets as sorted lists of event ids
+    parents.sort();
+
+    let (s, e) = (u.pos_start, u.pos_end);
+    // One event per character, so the run is as long as the text it inserts
+    // or deletes, and counting back from its last event gives its first.
+    let first_seq = u.seq_end + 1 - (e - s);
+
+    BraidUpdate {
+        version: vec![format!("{}-{}", u.agent, u.seq_end)],
+        first_event: format!("{}-{}", u.agent, first_seq),
+        parents,
+        patches: vec![RangePatch {
+            unit: "text",
+            // An insert replaces the empty range at `s`; a delete replaces
+            // the span of text it removes.
+            range: if u.content.is_some() { format!("[{s}:{s}]") }
+                   else { format!("[{s}:{e}]") },
+            content: u.content.map(|c| c.to_string()).unwrap_or_default(),
+        }],
+    }
+}
+
+fn to_updates(updates: Vec<diamond_types::list::observed_history::Update>,
+              oplog: &DTOpLog) -> WasmResult {
+    let out: Vec<BraidUpdate> = updates.into_iter()
+        .map(|u| to_update(u, oplog)).collect();
+    serde_wasm_bindgen::to_value(&out)
+}
+
+/// The updates since `since` (event id strings, or null/undefined for all of
+/// Observed History).
+pub fn get_updates(oplog: &DTOpLog, since: JsValue) -> WasmResult {
     let frontier: Vec<LV> = if since.is_null() || since.is_undefined() {
         Vec::new()
     } else {
@@ -186,53 +245,15 @@ pub fn get_updates(oplog: &DTOpLog, since: JsValue) -> WasmResult {
         }
     };
 
-    let aa = &oplog.cg.agent_assignment;
-    let patches: Vec<JsPatch> = oplog.updates_since(&frontier)
-        .into_iter().map(|p| {
-            let mut parents: Vec<String> = p.parents.as_ref().iter().map(|lv| {
-                let rv = aa.local_to_remote_version(*lv);
-                format!("{}-{}", rv.0, rv.1)
-            }).collect();
-            // The wire format sorts parents as version strings
-            parents.sort();
-
-            let (s, e) = (p.pos_start, p.pos_end);
-            JsPatch {
-                version: format!("{}-{}", p.agent, p.seq_end),
-                parents,
-                unit: "text",
-                // Inserts address a point; deletes address their span
-                range: if p.content.is_some() { format!("[{s}:{s}]") }
-                       else { format!("[{s}:{e}]") },
-                content: p.content.map(|c| c.to_string()).unwrap_or_default(),
-                start: s,
-                end: e,
-            }
-        }).collect();
-
-    serde_wasm_bindgen::to_value(&patches)
+    to_updates(oplog.updates_since(&frontier), oplog)
 }
 
-#[derive(serde::Serialize)]
-struct JsXFPatch {
-    unit: &'static str,
-    range: String,
-    content: String,
-}
-
-fn xf_patch_shape(patches: Vec<diamond_types::list::relative_to_absolute::Replacement>)
-    -> Vec<JsXFPatch> {
-    patches.into_iter().map(|p| JsXFPatch {
-        unit: "text",
-        range: format!("[{}:{}]", p.range.start, p.range.end),
-        content: p.content.to_string(),
-    }).collect()
-}
-
-/// The transformed changes since `since`, as absolute-coordinate range
-/// replacements: braid-text's get_xf_patches
+/// The transformed changes since `since`, as range patches against the
+/// current text: braid-text's get_xf_patches
 pub fn get_xf_patches(oplog: &DTOpLog, since: &[LV]) -> WasmResult {
-    serde_wasm_bindgen::to_value(&xf_patch_shape(oplog.xf_absolute_since(since)))
+    let patches: Vec<RangePatch> = oplog.xf_absolute_since(since)
+        .into_iter().map(to_range_patch).collect();
+    serde_wasm_bindgen::to_value(&patches)
 }
 
 /// The pure conversion, for callers holding relative patches already:
@@ -256,7 +277,9 @@ pub fn relative_to_absolute_patches_js(patches: JsValue) -> WasmResult {
         rel.push(Replacement { range: (start..end).into(),
                                content: p.content.as_str().into() });
     }
-    serde_wasm_bindgen::to_value(&xf_patch_shape(relative_to_absolute_patches(&rel)))
+    let patches: Vec<RangePatch> = relative_to_absolute_patches(&rel)
+        .into_iter().map(to_range_patch).collect();
+    serde_wasm_bindgen::to_value(&patches)
 }
 
 /// One remote edit as its author recorded it: an insert of `ins` at `pos`,
@@ -471,8 +494,8 @@ impl OpLog {
         agent_seq_runs(&self.inner)
     }
 
-    #[wasm_bindgen(js_name = getPatches)]
-    pub fn get_patches_js(&self, since: JsValue) -> WasmResult {
+    #[wasm_bindgen(js_name = getUpdates)]
+    pub fn get_updates_js(&self, since: JsValue) -> WasmResult {
         get_updates(&self.inner, since)
     }
 
@@ -616,6 +639,23 @@ impl Doc {
         agent_seq_runs(&self.inner.oplog)
     }
 
+    /// The updates covering local versions lo..hi, for a viewer showing a
+    /// window onto a long history. Local versions are topologically ordered,
+    /// so this is a contiguous slice of the document's past.
+    #[wasm_bindgen(js_name = getUpdatesInSpan)]
+    pub fn get_updates_in_span(&self, lo: usize, hi: usize) -> WasmResult {
+        to_updates(self.inner.oplog.updates_in_span((lo .. hi).into()),
+                   &self.inner.oplog)
+    }
+
+    /// How many local versions this document holds -- one per character ever
+    /// typed or deleted -- so a viewer can size its scrollbar without
+    /// materializing anything.
+    #[wasm_bindgen(js_name = numLocalVersions)]
+    pub fn num_local_versions(&self) -> usize {
+        self.inner.oplog.cg.len()
+    }
+
     /// The run of sequence numbers from `agent` that this document holds and
     /// that overlaps lo..=hi, returned as [first, last] inclusive. Undefined
     /// if the document holds none of that range.
@@ -663,8 +703,8 @@ impl Doc {
         Ok(())
     }
 
-    #[wasm_bindgen(js_name = getPatches)]
-    pub fn get_patches_js(&self, since: JsValue) -> WasmResult {
+    #[wasm_bindgen(js_name = getUpdates)]
+    pub fn get_updates_js(&self, since: JsValue) -> WasmResult {
         get_updates(&self.inner.oplog, since)
     }
 
