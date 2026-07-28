@@ -275,8 +275,10 @@ mod known_seq_span_tests {
         assert_eq!(aa.known_seq_span(b, (3..4).into()), None);
     }
 
-    /// A query overlapping the run only at its far end still finds it, which is
-    /// what braid-text's duplicate detection relies on.
+    /// A query overlapping the run only at its far end still finds it. Asking
+    /// "have I already seen any of these seqs?" depends on it: a caller that
+    /// missed a partial overlap would take an edit it already holds for a new
+    /// one.
     #[test]
     fn finds_a_run_the_query_only_touches() {
         let mut cg = CausalGraph::new();

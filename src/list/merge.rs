@@ -56,9 +56,10 @@ impl ListOpLog {
         self.iter_xf_operations_from(&[], self.cg.version.as_ref())
     }
 
-    /// The transformed changes since `frontier`, as replacements in
-    /// absolute coordinates of the text at `frontier`. This is what
-    /// braid-text broadcasts to simpleton clients.
+    /// The transformed changes since `frontier`, as replacements in absolute
+    /// coordinates of the text at `frontier`. A peer that does not track
+    /// history can apply these to its own copy in order, without needing to
+    /// merge anything.
     pub fn xf_absolute_since(&self, frontier: &[LV]) -> Vec<Replacement> {
         let rel: Vec<Replacement> = self
             .iter_xf_operations_from(frontier, self.cg.version.as_ref())

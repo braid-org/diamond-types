@@ -99,12 +99,40 @@ pub fn decode_and_add(oplog: &mut DTOpLog, bytes: &[u8]) -> WasmResult {
     }
 }
 
-pub fn xf_since(oplog: &DTOpLog, version: &[LV]) -> WasmResult {
-    let xf = oplog.iter_xf_operations_from(version, &oplog.local_frontier_ref())
-        .filter_map(|(_v, op)| op)
+/// One transformed operation, and the agent that wrote it.
+#[derive(serde::Serialize)]
+struct JsXfOp {
+    agent: String,
+    kind: &'static str,
+    start: usize,
+    end: usize,
+    fwd: bool,
+    content: String,
+}
+
+/// The operations between two versions, travelled into `from`'s frame: each
+/// one positioned against the document as it stood at `from`, so applying
+/// them in order turns that document into the one at `to`.
+pub fn xf_between(oplog: &DTOpLog, from: &[LV], to: &[LV]) -> WasmResult {
+    use diamond_types::list::operation::ListOpKind;
+    let aa = &oplog.cg.agent_assignment;
+    let xf = oplog.iter_xf_operations_from(from, to)
+        .filter_map(|(range, op)| op.map(|op| (range, op)))
+        .map(|(range, op)| JsXfOp {
+            agent: aa.local_to_remote_version(range.start).0.to_string(),
+            kind: if op.kind == ListOpKind::Ins { "Ins" } else { "Del" },
+            start: op.start(),
+            end: op.end(),
+            fwd: op.loc.fwd,
+            content: op.content_as_str().unwrap_or_default().to_string(),
+        })
         .collect::<Vec<_>>();
 
     serde_wasm_bindgen::to_value(&xf)
+}
+
+pub fn xf_since(oplog: &DTOpLog, version: &[LV]) -> WasmResult {
+    xf_between(oplog, version, &oplog.local_frontier_ref())
 }
 
 pub fn merge_versions(oplog: &DTOpLog, a: &[LV], b: &[LV]) -> Box<[LV]> {
@@ -199,7 +227,8 @@ fn to_update(u: diamond_types::list::observed_history::Update,
         let rv = aa.local_to_remote_version(*lv);
         format!("{}-{}", rv.0, rv.1)
     }).collect();
-    // braid-text compares parent sets as sorted lists of event ids
+    // A version is a set, so it has no order of its own. Sorting gives one,
+    // and two peers naming the same parents then produce the same list.
     parents.sort();
 
     let (s, e) = (u.pos_start, u.pos_end);
@@ -248,16 +277,17 @@ pub fn get_updates(oplog: &DTOpLog, since: JsValue) -> WasmResult {
     to_updates(oplog.updates_since(&frontier), oplog)
 }
 
-/// The transformed changes since `since`, as range patches against the
-/// current text: braid-text's get_xf_patches
+/// The transformed changes since `since`, as range patches against the current
+/// text.
 pub fn get_xf_patches(oplog: &DTOpLog, since: &[LV]) -> WasmResult {
     let patches: Vec<RangePatch> = oplog.xf_absolute_since(since)
         .into_iter().map(to_range_patch).collect();
     serde_wasm_bindgen::to_value(&patches)
 }
 
-/// The pure conversion, for callers holding relative patches already:
-/// braid-text's relative_to_absolute_patches
+/// Converts an array of "Relative" to "Absolute" patches:
+///  - Relative: Each patch applies *on top of* the previous patche's mutations
+///  - Absolute: Each patch references locations in *the prior document* before any mutations
 pub fn relative_to_absolute_patches_js(patches: JsValue) -> WasmResult {
     use diamond_types::list::relative_to_absolute::{Replacement, relative_to_absolute_patches};
 
@@ -652,18 +682,20 @@ impl Doc {
         agent_seq_runs(&self.inner.oplog)
     }
 
-    /// The updates covering local versions lo..hi, for a viewer showing a
-    /// window onto a long history. Local versions are topologically ordered,
-    /// so this is a contiguous slice of the document's past.
+    /// The updates covering local versions lo..hi. Local versions are
+    /// topologically ordered, so this is a contiguous slice of the document's
+    /// past, and it costs what the slice costs rather than what the whole
+    /// history would. Adjacent spans tile: together they give what one span
+    /// over both would, split at the seam.
     #[wasm_bindgen(js_name = getUpdatesInSpan)]
     pub fn get_updates_in_span(&self, lo: usize, hi: usize) -> WasmResult {
         to_updates(self.inner.oplog.updates_in_span((lo .. hi).into()),
                    &self.inner.oplog)
     }
 
-    /// How many local versions this document holds -- one per character ever
-    /// typed or deleted -- so a viewer can size its scrollbar without
-    /// materializing anything.
+    /// How many local versions this document holds, which is one per character
+    /// ever inserted or deleted. This is the extent that `getUpdatesInSpan`
+    /// indexes into, and answering it materializes nothing.
     #[wasm_bindgen(js_name = numLocalVersions)]
     pub fn num_local_versions(&self) -> usize {
         self.inner.oplog.cg.len()
@@ -819,6 +851,14 @@ impl Doc {
     #[wasm_bindgen(js_name = xfSince)]
     pub fn xf_since(&self, from_version: &[usize]) -> WasmResult {
         xf_since(&self.inner.oplog, from_version)
+    }
+
+    /// What happened between two versions, as operations against the document
+    /// as it stood at `from`. This is the same travel `xfSince` performs, with
+    /// somewhere other than the present as the destination.
+    #[wasm_bindgen(js_name = xfBetween)]
+    pub fn xf_between(&self, from: &[usize], to: &[usize]) -> WasmResult {
+        xf_between(&self.inner.oplog, from, to)
     }
 
     #[wasm_bindgen(js_name = getHistory)]

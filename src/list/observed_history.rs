@@ -146,10 +146,11 @@ impl ListOpLog {
     /// The updates covering a span of local versions.
     ///
     /// Local versions are numbered in a topological order, so a span of them
-    /// is a contiguous slice of history, which is what a viewer showing a
-    /// window onto a long document wants. Runs are summarized within the
-    /// span, never across its edges, so asking for adjacent spans gives the
-    /// same updates as asking for their union would, only split at the seam.
+    /// is a contiguous slice of history, and its cost is set by the span
+    /// rather than by the length of the document. Runs are summarized within
+    /// the span and never across its edges, so asking for adjacent spans
+    /// gives the same updates as asking for their union would, split at the
+    /// seam. That makes it safe to walk a history in pieces.
     pub fn updates_in_span(&self, span: DTRange) -> Vec<Update> {
         let end = span.end.min(self.cg.len());
         if span.start >= end { return Vec::new(); }
@@ -704,8 +705,8 @@ mod range_tests {
     use crate::list::ListOpLog;
 
     /// Adjacent spans must together give the same updates as one big span,
-    /// give or take runs being split at the seam. This is what lets a viewer
-    /// page through history a window at a time.
+    /// give or take runs being split at the seam. Without that, a history
+    /// could not be read in pieces.
     #[test]
     fn adjacent_spans_cover_the_whole() {
         let mut oplog = ListOpLog::new();
