@@ -3,7 +3,7 @@ mod utils;
 use wasm_bindgen::prelude::*;
 // use serde_wasm_bindgen::Serializer;
 // use serde::{Serialize};
-use diamond_types::{AgentId, LV};
+use diamond_types::{AgentId, DTRange, LV};
 use diamond_types::list::{ListBranch as DTBranch, ListCRDT, ListOpLog as DTOpLog};
 use diamond_types::list::encoding::{ENCODE_FULL, ENCODE_PATCH};
 use diamond_types::list::operation::TextOperation;
@@ -113,7 +113,7 @@ pub fn merge_versions(oplog: &DTOpLog, a: &[LV], b: &[LV]) -> Box<[LV]> {
 }
 
 /// Every (agent, seq_start, len) run this oplog knows, in local-version
-/// order. For building version indexes without parsing the file format.
+/// order. For building version indexes.
 pub fn agent_seq_runs(oplog: &DTOpLog) -> WasmResult {
     let runs: Vec<(&str, usize, usize)> = oplog.iter_remote_mappings()
         .map(|s| (s.0, s.1.start, s.1.end - s.1.start))
@@ -159,10 +159,9 @@ pub fn remote_to_local_version(oplog: &DTOpLog, ids: JsValue, tolerant: bool) ->
     }
 }
 
-/// Expand the history since `since` (remote version id strings, or
-/// null/undefined for everything) into braid-text's per-version patch
-/// shape: one patch per run of same-agent causally chained ops
-pub fn get_version_patches(oplog: &DTOpLog, since: JsValue) -> WasmResult {
+/// The updates since `since` (remote version id strings, or null/undefined
+/// for all of Observed History), serialized into the JS patch shape
+pub fn get_updates(oplog: &DTOpLog, since: JsValue) -> WasmResult {
     #[derive(serde::Serialize)]
     struct JsPatch {
         version: String,
@@ -188,13 +187,13 @@ pub fn get_version_patches(oplog: &DTOpLog, since: JsValue) -> WasmResult {
     };
 
     let aa = &oplog.cg.agent_assignment;
-    let patches: Vec<JsPatch> = oplog.version_patches_since(&frontier)
+    let patches: Vec<JsPatch> = oplog.updates_since(&frontier)
         .into_iter().map(|p| {
             let mut parents: Vec<String> = p.parents.as_ref().iter().map(|lv| {
                 let rv = aa.local_to_remote_version(*lv);
                 format!("{}-{}", rv.0, rv.1)
             }).collect();
-            // Braid sorts parents as version strings
+            // The wire format sorts parents as version strings
             parents.sort();
 
             let (s, e) = (p.pos_start, p.pos_end);
@@ -221,7 +220,7 @@ struct JsXFPatch {
     content: String,
 }
 
-fn xf_patch_shape(patches: Vec<diamond_types::list::xf_patches::Replacement>)
+fn xf_patch_shape(patches: Vec<diamond_types::list::relative_to_absolute::Replacement>)
     -> Vec<JsXFPatch> {
     patches.into_iter().map(|p| JsXFPatch {
         unit: "text",
@@ -239,7 +238,7 @@ pub fn get_xf_patches(oplog: &DTOpLog, since: &[LV]) -> WasmResult {
 /// The pure conversion, for callers holding relative patches already:
 /// braid-text's relative_to_absolute_patches
 pub fn relative_to_absolute_patches_js(patches: JsValue) -> WasmResult {
-    use diamond_types::list::xf_patches::{Replacement, relative_to_absolute_patches};
+    use diamond_types::list::relative_to_absolute::{Replacement, relative_to_absolute_patches};
 
     #[derive(serde::Deserialize)]
     struct In { range: String, content: String }
@@ -260,32 +259,44 @@ pub fn relative_to_absolute_patches_js(patches: JsValue) -> WasmResult {
     serde_wasm_bindgen::to_value(&xf_patch_shape(relative_to_absolute_patches(&rel)))
 }
 
-/// Apply one remote op run (an insert or a delete) straight into the
-/// oplog, instead of building a synthetic dt file for it and merging that
-pub fn apply_remote_op(oplog: &mut DTOpLog, agent: &str, start_seq: usize,
-                       parents: JsValue, pos: usize, del: usize, ins: Option<String>)
-                       -> WasmResult<Box<[usize]>> {
-    let ids: Vec<String> = serde_wasm_bindgen::from_value(parents)?;
-    let parents = match parse_remote_ids(oplog, &ids, false) {
-        Ok(p) => p,
-        Err(s) => {
-            let js: JsValue = s.into();
-            return Err(js.into());
-        }
-    };
-    let agent = oplog.get_or_create_agent_id(agent);
+/// One remote edit as its author recorded it: an insert of `ins` at `pos`,
+/// or a delete of `del` characters starting at `pos`, both positioned
+/// against the document as it stood at `parents`.
+#[derive(serde::Deserialize)]
+struct RemoteOp {
+    agent: String,
+    seq: usize,
+    parents: Vec<String>,
+    pos: usize,
+    #[serde(default)]
+    del: usize,
+    #[serde(default)]
+    ins: Option<String>,
+}
 
-    let op = if del > 0 {
-        let mut op = TextOperation::new_delete(pos .. pos + del);
-        // dt_create_bytes encodes deletes as backward runs; match it
-        op.loc.fwd = false;
-        op
+fn js_error(message: String) -> serde_wasm_bindgen::Error {
+    let js: JsValue = message.into();
+    js.into()
+}
+
+/// Record a remote edit in the oplog. The branch is left where it is, so a
+/// caller adding a run of edits can pay for one merge at the end.
+fn add_remote_op(oplog: &mut DTOpLog, op: &RemoteOp) -> Result<DTRange, String> {
+    let parents = parse_remote_ids(oplog, &op.parents, false)?;
+    let agent = oplog.get_or_create_agent_id(&op.agent);
+
+    let text_op = if op.del > 0 {
+        let mut text_op = TextOperation::new_delete(op.pos .. op.pos + op.del);
+        // Sequence numbers within a delete run count backward from the end
+        // of the range: the first character deleted is the range's last
+        // one, as when holding down backspace.
+        text_op.loc.fwd = false;
+        text_op
     } else {
-        TextOperation::new_insert(pos, ins.as_deref().unwrap_or(""))
+        TextOperation::new_insert(op.pos, op.ins.as_deref().unwrap_or(""))
     };
 
-    let range = oplog.add_operations_remote(agent, &parents, start_seq, &[op]);
-    Ok(Box::new([range.start, range.end]))
+    Ok(oplog.add_operations_remote(agent, &parents, op.seq, &[text_op]))
 }
 
 fn unwrap_agentid(agent_id: Option<AgentId>) -> AgentId {
@@ -462,7 +473,7 @@ impl OpLog {
 
     #[wasm_bindgen(js_name = getPatches)]
     pub fn get_patches_js(&self, since: JsValue) -> WasmResult {
-        get_version_patches(&self.inner, since)
+        get_updates(&self.inner, since)
     }
 
     #[wasm_bindgen(js_name = getRemoteVersion)]
@@ -525,6 +536,14 @@ pub struct Doc {
     agent_id: Option<AgentId>,
 }
 
+impl Doc {
+    /// Bring the branch up to the oplog's newest version, so that reading
+    /// the document reflects everything in it.
+    fn merge_to_tip(&mut self) {
+        self.inner.branch.merge(&self.inner.oplog, self.inner.oplog.cg.version.as_ref());
+    }
+}
+
 
 // #[wasm_bindgen]
 // extern "C" {
@@ -580,10 +599,11 @@ impl Doc {
         self.inner.oplog.checkout(version).content().to_string()
     }
 
-    /// The document's length in characters as of some historical version
+    /// The document's length in characters as of some historical version.
+    /// Cheaper than getStringAt, since it never builds the text.
     #[wasm_bindgen(js_name = lenAt)]
     pub fn len_at(&self, version: &[LV]) -> usize {
-        self.inner.oplog.checkout(version).len()
+        self.inner.oplog.len_at(version)
     }
 
     #[wasm_bindgen(js_name = remoteToLocalVersion)]
@@ -596,18 +616,56 @@ impl Doc {
         agent_seq_runs(&self.inner.oplog)
     }
 
+    /// The run of sequence numbers from `agent` that this document holds and
+    /// that overlaps lo..=hi, returned as [first, last] inclusive. Undefined
+    /// if the document holds none of that range.
+    #[wasm_bindgen(js_name = knownSeqSpan)]
+    pub fn known_seq_span_js(&self, agent: &str, lo: usize, hi: usize) -> Option<Box<[usize]>> {
+        let aa = &self.inner.oplog.cg.agent_assignment;
+        let id = aa.get_agent_id(agent)?;
+        let span = aa.known_seq_span(id, (lo .. hi + 1).into())?;
+        Some(Box::new([span.start, span.end - 1]))
+    }
+
+    /// Apply one remote edit, and bring the document up to date with it.
     #[wasm_bindgen(js_name = applyRemoteOp)]
     pub fn apply_remote_op_js(&mut self, agent: &str, start_seq: usize, parents: JsValue,
                               pos: usize, del: usize, ins: Option<String>) -> WasmResult<Box<[usize]>> {
-        let result = apply_remote_op(&mut self.inner.oplog, agent, start_seq, parents, pos, del, ins)?;
-        // Keep the branch at the tip, the way mergeBytes does
-        self.inner.branch.merge(&self.inner.oplog, self.inner.oplog.cg.version.as_ref());
-        Ok(result)
+        let op = RemoteOp {
+            agent: agent.to_string(),
+            seq: start_seq,
+            parents: serde_wasm_bindgen::from_value(parents)?,
+            pos, del, ins,
+        };
+        let range = add_remote_op(&mut self.inner.oplog, &op).map_err(js_error)?;
+        self.merge_to_tip();
+        Ok(Box::new([range.start, range.end]))
+    }
+
+    /// Apply a run of remote edits, and bring the document up to date once
+    /// at the end.
+    ///
+    /// Merging is the expensive half of applying an edit, and its cost is
+    /// set by how much concurrent history has to be transformed rather than
+    /// by how many edits arrive. So merging a run of edits together costs
+    /// about what merging one of them does, and applying them one at a time
+    /// costs that much per edit.
+    ///
+    /// Each edit's parents must already be in the oplog, or belong to an
+    /// earlier edit in the same run.
+    #[wasm_bindgen(js_name = applyRemoteOps)]
+    pub fn apply_remote_ops_js(&mut self, ops: JsValue) -> WasmResult<()> {
+        let ops: Vec<RemoteOp> = serde_wasm_bindgen::from_value(ops)?;
+        for op in &ops {
+            add_remote_op(&mut self.inner.oplog, op).map_err(js_error)?;
+        }
+        self.merge_to_tip();
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = getPatches)]
     pub fn get_patches_js(&self, since: JsValue) -> WasmResult {
-        get_version_patches(&self.inner.oplog, since)
+        get_updates(&self.inner.oplog, since)
     }
 
     #[wasm_bindgen(js_name = getXFPatches)]

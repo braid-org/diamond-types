@@ -5,6 +5,8 @@ use crate::frontier::FrontierRef;
 use crate::list::{ListBranch, ListOpLog};
 use crate::list::op_metrics::ListOpMetrics;
 use crate::list::operation::{ListOpKind, TextOperation};
+use crate::list::relative_to_absolute::{Replacement, relative_to_absolute_patches};
+use smartstring::alias::String as SmartString;
 use crate::listmerge::merge::{reverse_str, TransformedOpsIterRaw, TransformedResultRaw, TransformedSimpleOp, TransformedSimpleOpsIter};
 use crate::listmerge::merge::TransformedResult::{BaseMoved, DeleteAlreadyHappened};
 use crate::listmerge::plan::M1PlanAction;
@@ -52,6 +54,63 @@ impl ListOpLog {
     /// See [OpLog::iter_xf_operations_from](OpLog::iter_xf_operations_from) for more information.
     pub fn iter_xf_operations(&self) -> impl Iterator<Item=(DTRange, Option<TextOperation>)> + '_ {
         self.iter_xf_operations_from(&[], self.cg.version.as_ref())
+    }
+
+    /// The transformed changes since `frontier`, as replacements in
+    /// absolute coordinates of the text at `frontier`. This is what
+    /// braid-text broadcasts to simpleton clients.
+    pub fn xf_absolute_since(&self, frontier: &[LV]) -> Vec<Replacement> {
+        let rel: Vec<Replacement> = self
+            .iter_xf_operations_from(frontier, self.cg.version.as_ref())
+            .filter_map(|(_, op)| op)
+            .map(|op| match op.kind {
+                ListOpKind::Ins => Replacement {
+                    range: (op.loc.span.start..op.loc.span.start).into(),
+                    content: op.content.unwrap_or_default(),
+                },
+                ListOpKind::Del => Replacement {
+                    range: op.loc.span,
+                    content: SmartString::new(),
+                },
+            })
+            .collect();
+        relative_to_absolute_patches(&rel)
+    }
+
+    /// The document's length in characters as of some version.
+    ///
+    /// This walks the same transformed operations that a checkout would
+    /// apply, but only tallies their lengths, so it never builds the text
+    /// itself. Concurrent deletes of the same character are counted once,
+    /// since the transform reports the redundant half as already deleted.
+    pub fn len_at(&self, version: FrontierRef) -> usize {
+        let mut len = 0usize;
+
+        for xf in self.get_xf_operations_full(&[], version) {
+            match xf {
+                TransformedResultRaw::Apply { op: KVPair(_, op), .. } => {
+                    match op.kind {
+                        ListOpKind::Ins => len += op.len(),
+                        ListOpKind::Del => len -= op.len(),
+                    }
+                }
+
+                // A fast-forwarded span needs no transforming, so its ops
+                // are read straight out of the oplog.
+                TransformedResultRaw::FF(range) => {
+                    for KVPair(_, op) in self.operations.iter_range_ctx(range, &self.operation_ctx) {
+                        match op.kind {
+                            ListOpKind::Ins => len += op.len(),
+                            ListOpKind::Del => len -= op.len(),
+                        }
+                    }
+                }
+
+                TransformedResultRaw::DeleteAlreadyHappened(_) => {}
+            }
+        }
+
+        len
     }
 
     #[cfg(feature = "merge_conflict_checks")]
@@ -177,5 +236,34 @@ impl ListBranch {
         }
         
         self.version = oplog.cg.graph.find_dominators_2(self.version.as_ref(), merge_frontier);
+    }
+}
+#[cfg(test)]
+mod test {
+    use crate::list::ListOpLog;
+
+    /// len_at tallies the transformed ops rather than replaying them, so it
+    /// has to agree with a checkout at every version -- including ones where
+    /// concurrent deletes overlap, and the same character is deleted twice.
+    #[test]
+    fn len_at_matches_checkout() {
+        let mut oplog = ListOpLog::new();
+        let a = oplog.get_or_create_agent_id("a");
+        let b = oplog.get_or_create_agent_id("b");
+
+        let base = oplog.add_insert_at(a, &[], 0, "hello world");
+
+        // Both agents branch from `base` and delete overlapping ranges.
+        let a_del = oplog.add_delete_at(a, &[base], 0..6);  // "hello "
+        let b_del = oplog.add_delete_at(b, &[base], 3..8);  // "lo wo"
+
+        // ...and then one of them types again on top of the merge.
+        let tip = oplog.add_insert_at(a, &[a_del, b_del], 1, "XY");
+
+        for version in [vec![base], vec![a_del], vec![b_del],
+                        vec![a_del, b_del], vec![tip]] {
+            assert_eq!(oplog.len_at(&version), oplog.checkout(&version).len(),
+                       "length disagrees at {version:?}");
+        }
     }
 }

@@ -571,7 +571,7 @@ impl ListOpLog {
             }
 
             // Remove excess agents
-            self.cg.agent_assignment.client_data.truncate(num_known_agents);
+            self.cg.agent_assignment.truncate_agents(num_known_agents);
 
             self.operation_ctx.ins_content.truncate(ins_content_length);
             self.operation_ctx.del_content.truncate(del_content_length);

@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use smartstring::alias::String as SmartString;
 use rle::HasLength;
 use crate::causalgraph::agent_span::{AgentSpan, AgentVersion};
@@ -43,6 +44,11 @@ pub struct AgentAssignment {
     /// This is used to map external CRDT locations -> Order numbers.
     pub(crate) client_data: Vec<ClientData>,
 
+    /// Agent name -> AgentId. Resolving a remote version starts by naming its
+    /// author, and documents can accumulate a lot of authors (a peer that mints
+    /// a fresh agent per session will have thousands), so this needs to not be
+    /// a scan over client_data.
+    agent_ids: HashMap<SmartString, AgentId>,
 }
 
 
@@ -85,9 +91,7 @@ impl AgentAssignment {
     pub fn new() -> Self { Self::default() }
 
     pub fn get_agent_id(&self, name: &str) -> Option<AgentId> {
-        self.client_data.iter()
-            .position(|client_data| client_data.name == name)
-            .map(|id| id as AgentId)
+        self.agent_ids.get(name).copied()
     }
 
     pub fn get_or_create_agent_id(&mut self, name: &str) -> AgentId {
@@ -104,7 +108,52 @@ impl AgentAssignment {
                 name: SmartString::from(name),
                 lv_for_seq: RleVec::new()
             });
-            (self.client_data.len() - 1) as AgentId
+            let id = (self.client_data.len() - 1) as AgentId;
+            self.agent_ids.insert(SmartString::from(name), id);
+            id
+        }
+    }
+
+    /// The run of sequence numbers from `agent` that this document holds and
+    /// that overlaps `seq_range`, or None if it holds none of that range.
+    ///
+    /// The returned span is the whole contiguous run, which may extend past
+    /// `seq_range` in both directions. Note an author's sequence numbers stay
+    /// contiguous even when the local versions they map to do not, which
+    /// happens whenever their edits were interleaved with somebody else's, so
+    /// a single run can span several stored entries.
+    pub fn known_seq_span(&self, agent: AgentId, seq_range: DTRange) -> Option<DTRange> {
+        if seq_range.is_empty() { return None; }
+        let entries = &self.client_data.get(agent as usize)?.lv_for_seq.0;
+
+        let seq_end = |e: &KVPair<DTRange>| e.0 + e.1.len();
+
+        // The last entry beginning at or before the end of the query
+        let after = entries.partition_point(|e| e.0 <= seq_range.last());
+        if after == 0 { return None; }
+        let mut i = after - 1;
+        if seq_range.start >= seq_end(&entries[i]) { return None; }
+
+        let mut start = entries[i].0;
+        let mut end = seq_end(&entries[i]);
+        while i > 0 && seq_end(&entries[i - 1]) == start {
+            i -= 1;
+            start = entries[i].0;
+        }
+        let mut j = after;
+        while j < entries.len() && entries[j].0 == end {
+            end = seq_end(&entries[j]);
+            j += 1;
+        }
+
+        Some((start..end).into())
+    }
+
+    /// Drop every agent from `keep` onward. Used when a partly-decoded file is
+    /// rolled back.
+    pub(crate) fn truncate_agents(&mut self, keep: usize) {
+        for client in self.client_data.drain(keep..) {
+            self.agent_ids.remove(&client.name);
         }
     }
 
@@ -192,5 +241,56 @@ impl AgentAssignment {
                 self.local_to_agent_version(v2)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod known_seq_span_tests {
+    use crate::causalgraph::agent_span::AgentSpan;
+    use crate::CausalGraph;
+
+    /// An author's sequence numbers stay contiguous even when his edits are
+    /// interleaved with somebody else's, which splits them across several
+    /// stored entries. known_seq_span has to report the whole run regardless.
+    #[test]
+    fn merges_across_interleaved_entries() {
+        let mut cg = CausalGraph::new();
+        let a = cg.get_or_create_agent_id("a");
+        let b = cg.get_or_create_agent_id("b");
+
+        // a writes seqs 0..5, then b interrupts, then a continues at seq 5
+        cg.merge_and_assign(&[], AgentSpan { agent: a, seq_range: (0..5).into() });
+        cg.merge_and_assign(&[], AgentSpan { agent: b, seq_range: (0..3).into() });
+        cg.merge_and_assign(&[], AgentSpan { agent: a, seq_range: (5..9).into() });
+
+        let aa = &cg.agent_assignment;
+        // a's stored entries are split, but the run is 0..9 throughout
+        for probe in 0..9usize {
+            let span = aa.known_seq_span(a, (probe..probe + 1).into())
+                .unwrap_or_else(|| panic!("missing seq {probe}"));
+            assert_eq!((span.start, span.end), (0, 9), "at seq {probe}");
+        }
+        assert_eq!(aa.known_seq_span(a, (9..10).into()), None);
+        assert_eq!(aa.known_seq_span(b, (0..1).into()).map(|s| (s.start, s.end)), Some((0, 3)));
+        assert_eq!(aa.known_seq_span(b, (3..4).into()), None);
+    }
+
+    /// A query overlapping the run only at its far end still finds it, which is
+    /// what braid-text's duplicate detection relies on.
+    #[test]
+    fn finds_a_run_the_query_only_touches() {
+        let mut cg = CausalGraph::new();
+        let a = cg.get_or_create_agent_id("a");
+        cg.merge_and_assign(&[], AgentSpan { agent: a, seq_range: (8..12).into() });
+        let aa = &cg.agent_assignment;
+
+        // query spans a gap and then reaches the run
+        assert_eq!(aa.known_seq_span(a, (5..11).into()).map(|s| (s.start, s.end)), Some((8, 12)));
+        // query entirely below it
+        assert_eq!(aa.known_seq_span(a, (0..8).into()), None);
+        // query entirely above it
+        assert_eq!(aa.known_seq_span(a, (12..20).into()), None);
+        // unknown agent
+        assert_eq!(aa.known_seq_span(99, (0..1).into()), None);
     }
 }

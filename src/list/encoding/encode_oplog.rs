@@ -358,6 +358,21 @@ impl ListOpLog {
     /// Encode the data stored in the OpLog into a (custom) compact binary form suitable for saving
     /// to disk, or sending over the network.
     pub fn encode_from(&self, opts: &EncodeOptions, from_version: &[LV]) -> Vec<u8> {
+        let (_, ranges) = self.cg.graph.diff(from_version, self.cg.version.as_ref());
+        self.encode_ranges(opts, from_version, &ranges, self.cg.version.as_ref())
+    }
+
+    /// Encode a chosen set of local-version ranges, rather than everything between two versions.
+    ///
+    /// `ranges` must be ordered so that each operation's parents come before it, and must be closed
+    /// under ancestry -- every parent of an included operation is itself included. `end_version` is
+    /// the version the encoded operations add up to.
+    ///
+    /// This is what lets a caller serialize the history as of some past version without first
+    /// rebuilding a separate oplog to renumber it: the parent writer below already maps local
+    /// versions onto their positions in the output, through `txn_map`.
+    pub(crate) fn encode_ranges(&self, opts: &EncodeOptions, from_version: &[LV],
+                                ranges: &[DTRange], end_version: &[LV]) -> Vec<u8> {
         // if !frontier_is_root(from_frontier) {
         //     unimplemented!("Encoding from a non-root frontier is not implemented");
         // }
@@ -551,10 +566,9 @@ impl ListOpLog {
         // let iter = self.cg.history.optimized_txns_between(from_frontier, &self.frontier);
         if !opts.sort {
             assert_eq!(opts.store_xf, false);
-            let (_, new_ranges) = self.cg.graph.diff(from_version, self.cg.version.as_ref());
             // for walk in self.cg.graph.iter_range() {
             // for walk in self.cg.graph.optimized_txns_between(from_version, self.cg.version.as_ref()) {
-            for ge in new_ranges.iter().flat_map(|r| self.cg.graph.iter_range(*r)) {
+            for ge in ranges.iter().flat_map(|r| self.cg.graph.iter_range(*r)) {
                 process_ops(ge);
             }
         } else {
@@ -565,7 +579,7 @@ impl ListOpLog {
                 push_leb_usize(buf, e.len);
             });
 
-            for r in self.get_xf_operations_full(from_version, self.cg.version.as_ref()) {
+            for r in self.get_xf_operations_full(from_version, end_version) {
                 let range = r.lv_range();
                 self.cg.graph.with_parents(range.start, |parents| {
                     let ge = GraphEntrySimple {
@@ -639,9 +653,9 @@ impl ListOpLog {
 
         let end_branch = if opts.store_end_branch_content {
             let mut end_branch = Vec::new();
-            write_local_version(&mut end_branch, self.cg.version.as_ref(), &mut agent_mapping, self);
+            write_local_version(&mut end_branch, end_version, &mut agent_mapping, self);
 
-            let branch_here = ListBranch::new_at_tip(self);
+            let branch_here = ListBranch::new_at_local_version(self, end_version);
             if verbose {
                 println!("End content length (uncompressed) {}", branch_here.content.len_bytes());
             }
